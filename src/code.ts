@@ -6,16 +6,24 @@ interface ExportRequest {
   compressionTimes: number;
   format: 'png' | 'jpg' | 'webp';
   scale: number;
+  workerBase: string;
 }
 
-interface GetApiKeyRequest {
-  type: 'get-api-key';
+interface GetSettingsRequest {
+  type: 'get-settings';
+}
+
+interface SaveSettingsRequest {
+  type: 'save-settings';
+  apiKey: string;
+  workerBase: string;
 }
 
 interface TinyPNGUploadRequest {
   type: 'tinypng-upload';
   data: number[];
   apiKey: string;
+  workerBase: string;
   requestId: string;
 }
 
@@ -24,26 +32,43 @@ interface TinyPNGDownloadRequest {
   url: string;
   apiKey: string;
   format: string;
+  workerBase: string;
   requestId: string;
 }
 
-type UIMessage = ExportRequest | GetApiKeyRequest | TinyPNGUploadRequest | TinyPNGDownloadRequest;
+type UIMessage =
+  | ExportRequest
+  | GetSettingsRequest
+  | SaveSettingsRequest
+  | TinyPNGUploadRequest
+  | TinyPNGDownloadRequest;
 
 const STORAGE_KEY_API = 'tinypng_api_key';
-const WORKER_BASE = 'https://tinypng-upload.2854919592.workers.dev';
+const STORAGE_KEY_WORKER = 'tinypng_worker_base';
 
-figma.showUI(__html__, { width: 320, height: 520 });
+figma.showUI(__html__, { width: 320, height: 560 });
 
 figma.ui.onmessage = async (msg: UIMessage) => {
-  if (msg.type === 'get-api-key') {
-    const key = await figma.clientStorage.getAsync(STORAGE_KEY_API);
-    figma.ui.postMessage({ type: 'load-api-key', key: key ?? '' });
+  if (msg.type === 'get-settings') {
+    const apiKey = await figma.clientStorage.getAsync(STORAGE_KEY_API);
+    const workerBase = await figma.clientStorage.getAsync(STORAGE_KEY_WORKER);
+    figma.ui.postMessage({
+      type: 'load-settings',
+      apiKey: apiKey ?? '',
+      workerBase: workerBase ?? '',
+    });
+    return;
+  }
+
+  if (msg.type === 'save-settings') {
+    await figma.clientStorage.setAsync(STORAGE_KEY_API, msg.apiKey);
+    await figma.clientStorage.setAsync(STORAGE_KEY_WORKER, msg.workerBase);
     return;
   }
 
   if (msg.type === 'tinypng-upload') {
     try {
-      const res = await fetch(`${WORKER_BASE}/shrink`, {
+      const res = await fetch(msg.workerBase + '/shrink', {
         method: 'POST',
         headers: {
           'X-TinyPNG-Key': msg.apiKey,
@@ -60,13 +85,12 @@ figma.ui.onmessage = async (msg: UIMessage) => {
         body,
       });
     } catch (e: unknown) {
-      const errStr = e instanceof Error ? e.message : String(e);
       figma.ui.postMessage({
         type: 'tinypng-upload-result',
         requestId: msg.requestId,
         ok: false,
         status: 0,
-        body: errStr,
+        body: e instanceof Error ? e.message : String(e),
       });
     }
     return;
@@ -74,7 +98,7 @@ figma.ui.onmessage = async (msg: UIMessage) => {
 
   if (msg.type === 'tinypng-download') {
     try {
-      const res = await fetch(`${WORKER_BASE}/download`, {
+      const res = await fetch(msg.workerBase + '/download', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -103,22 +127,20 @@ figma.ui.onmessage = async (msg: UIMessage) => {
         data: Array.from(new Uint8Array(buf)),
       });
     } catch (e: unknown) {
-      const errStr = e instanceof Error ? e.message : String(e);
       figma.ui.postMessage({
         type: 'tinypng-download-result',
         requestId: msg.requestId,
         ok: false,
         status: 0,
         data: [],
-        error: errStr,
+        error: e instanceof Error ? e.message : String(e),
       });
     }
     return;
   }
 
   if (msg.type === 'start-export') {
-    const { apiKey, compressionTimes, format, scale } = msg;
-    await figma.clientStorage.setAsync(STORAGE_KEY_API, apiKey);
+    const { apiKey, compressionTimes, format, scale, workerBase } = msg;
 
     const selection = figma.currentPage.selection;
     if (selection.length === 0) {
@@ -154,6 +176,7 @@ figma.ui.onmessage = async (msg: UIMessage) => {
         format,
         compressionTimes,
         progress,
+        workerBase,
       });
     }
 

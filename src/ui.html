@@ -16,17 +16,22 @@
   .row { display: flex; gap: 8px; }
   .row .field { flex: 1; }
   .hint { font-size: 10px; color: #999; margin-top: 3px; }
+  .hint a { color: #18a0fb; text-decoration: none; }
+  .hint a:hover { text-decoration: underline; }
   .btn { width: 100%; padding: 8px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 600; }
   .btn-primary { background: #18a0fb; color: #fff; }
   .btn-primary:hover { background: #0d8de0; }
   .btn-primary:disabled { background: #a0cfed; cursor: not-allowed; }
   hr { border: none; border-top: 1px solid #eee; margin: 10px 0; }
-  #log { margin-top: 10px; background: #f7f7f7; border: 1px solid #e0e0e0; border-radius: 4px; padding: 8px; height: 150px; overflow-y: auto; font-size: 11px; line-height: 1.7; font-family: monospace; }
+  #log { margin-top: 10px; background: #f7f7f7; border: 1px solid #e0e0e0; border-radius: 4px; padding: 8px; height: 130px; overflow-y: auto; font-size: 11px; line-height: 1.7; font-family: monospace; }
   .i { color: #333; } .s { color: #1a8a3a; } .e { color: #d0021b; } .w { color: #d48806; }
   #progress-bar-wrap { margin-top: 6px; background: #eee; border-radius: 2px; height: 4px; display: none; }
   #progress-bar { height: 4px; background: #18a0fb; border-radius: 2px; width: 0%; transition: width 0.2s; }
   .key-wrap { position: relative; }
   .toggle-key { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; font-size: 11px; color: #999; }
+  details { margin-bottom: 10px; }
+  summary { font-size: 11px; color: #888; cursor: pointer; user-select: none; }
+  summary:hover { color: #555; }
 </style>
 </head>
 <body>
@@ -40,6 +45,20 @@
   </div>
   <div class="hint">前往 <a href="https://tinypng.com/developers" target="_blank" rel="noopener noreferrer">tinypng.com/developers</a> 免费申请</div>
 </div>
+
+<details id="advancedSection">
+  <summary>高级设置 ▸</summary>
+  <div style="padding-top:8px;">
+    <div class="field">
+      <label>Worker 代理地址</label>
+      <input id="workerBase" type="text" placeholder="https://your-worker.workers.dev" autocomplete="off" />
+      <div class="hint">
+        留空则使用默认地址。担心 API Key 泄露？
+        <a id="workerCodeLink" href="#" target="_blank" rel="noopener noreferrer">查看 Worker 源码</a>，自行部署到 Cloudflare。
+      </div>
+    </div>
+  </div>
+</details>
 
 <div class="row">
   <div class="field">
@@ -72,6 +91,10 @@
 <div id="log"></div>
 
 <script>
+const DEFAULT_WORKER_BASE = 'https://tinypng-upload.2854919592.workers.dev';
+// Worker 源码托管地址（替换为你的 GitHub/Gist 链接）
+const WORKER_CODE_URL = 'https://gist.github.com/GarF1eldGo/47cad866062d08bc74ffabba51bded4d';
+
 const $ = id => document.getElementById(id);
 const logEl = $('log');
 
@@ -84,11 +107,19 @@ function log(msg, type) {
 }
 function setProgress(pct) { $('progress-bar').style.width = pct + '%'; }
 
+// Set worker code link
+$('workerCodeLink').href = WORKER_CODE_URL;
+
 $('toggleKey').addEventListener('click', function() {
   const inp = $('apiKey');
   inp.type = inp.type === 'password' ? 'text' : 'password';
   this.textContent = inp.type === 'password' ? '显示' : '隐藏';
 });
+
+function getWorkerBase() {
+  const custom = $('workerBase').value.trim().replace(/\/$/, '');
+  return custom || DEFAULT_WORKER_BASE;
+}
 
 // ── Promise bridge: network calls delegated to code.ts sandbox ──────────────
 const pending = {};
@@ -102,8 +133,8 @@ function pluginFetch(type, params) {
   });
 }
 
-async function tinypngUpload(data, apiKey) {
-  const res = await pluginFetch('tinypng-upload', { data, apiKey });
+async function tinypngUpload(data, apiKey, workerBase) {
+  const res = await pluginFetch('tinypng-upload', { data, apiKey, workerBase });
   const bodyStr = String(res.body != null ? res.body : '');
   if (!res.ok) {
     let errMsg = 'HTTP ' + res.status;
@@ -123,8 +154,8 @@ async function tinypngUpload(data, apiKey) {
   return json;
 }
 
-async function tinypngDownload(url, apiKey, format) {
-  const res = await pluginFetch('tinypng-download', { url, apiKey, format });
+async function tinypngDownload(url, apiKey, format, workerBase) {
+  const res = await pluginFetch('tinypng-download', { url, apiKey, format, workerBase });
   if (!res.ok) {
     const detail = res.error ? String(res.error) : ('HTTP ' + res.status);
     throw new Error('下载失败: ' + detail);
@@ -132,9 +163,9 @@ async function tinypngDownload(url, apiKey, format) {
   return res.data;
 }
 
-async function compressOnce(data, apiKey, format) {
-  const uploadResult = await tinypngUpload(data, apiKey);
-  return await tinypngDownload(uploadResult.output.url, apiKey, format);
+async function compressOnce(data, apiKey, format, workerBase) {
+  const uploadResult = await tinypngUpload(data, apiKey, workerBase);
+  return await tinypngDownload(uploadResult.output.url, apiKey, format, workerBase);
 }
 
 // ── Task queue ──────────────────────────────────────────────────────────────
@@ -162,7 +193,7 @@ function checkAllDone() {
 }
 
 async function processTask(task) {
-  const { data, filename, format, compressionTimes, progress } = task;
+  const { data, filename, format, compressionTimes, progress, workerBase } = task;
   const apiKey = $('apiKey').value.trim();
   log('开始处理: ' + filename);
 
@@ -173,7 +204,7 @@ async function processTask(task) {
   for (let round = 1; round <= compressionTimes; round++) {
     log('  第 ' + round + '/' + compressionTimes + ' 次压缩...');
     try {
-      current = await compressOnce(current, apiKey, format);
+      current = await compressOnce(current, apiKey, format, workerBase);
       const saved = ((1 - current.length / originalSize) * 100).toFixed(1);
       log('  压缩完成，共节省 ' + saved + '%', 's');
     } catch(e) {
@@ -211,8 +242,9 @@ window.onmessage = function(event) {
     if (resolve) { delete pending[msg.requestId]; resolve(msg); }
     return;
   }
-  if (msg.type === 'load-api-key') {
-    if (msg.key) $('apiKey').value = msg.key;
+  if (msg.type === 'load-settings') {
+    if (msg.apiKey) $('apiKey').value = msg.apiKey;
+    if (msg.workerBase) $('workerBase').value = msg.workerBase;
     return;
   }
   if (msg.type === 'export-error') {
@@ -245,11 +277,20 @@ $('exportBtn').addEventListener('click', function() {
   const times = parseInt($('compressionTimes').value, 10) || 2;
   if (times < 1 || times > 10) { log('压缩次数范围为 1~10', 'w'); return; }
 
+  const workerBase = getWorkerBase();
+
   this.disabled = true;
   logEl.innerHTML = '';
   queue = []; processing = false; doneCount = 0; totalExpected = 0; allSent = false;
   $('progress-bar-wrap').style.display = 'block';
   setProgress(0);
+
+  // Persist settings
+  parent.postMessage({ pluginMessage: {
+    type: 'save-settings',
+    apiKey,
+    workerBase: $('workerBase').value.trim(),
+  }}, '*');
 
   parent.postMessage({ pluginMessage: {
     type: 'start-export',
@@ -257,10 +298,11 @@ $('exportBtn').addEventListener('click', function() {
     compressionTimes: times,
     format: $('exportFormat').value,
     scale: parseFloat($('exportScale').value),
+    workerBase,
   }}, '*');
 });
 
-parent.postMessage({ pluginMessage: { type: 'get-api-key' } }, '*');
+parent.postMessage({ pluginMessage: { type: 'get-settings' } }, '*');
 </script>
 </body>
 </html>

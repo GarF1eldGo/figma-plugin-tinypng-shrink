@@ -6,7 +6,7 @@
   "ui": "dist/ui.html",
   "editorType": ["figma"],
   "networkAccess": {
-    "allowedDomains": ["https://api.tinify.com", "https://httpbin.org", "https://tinypng-upload.2854919592.workers.dev"],
+    "allowedDomains": ["*"],
     "reasoning": "Used to compress exported images via TinyPNG API"
   }
 }
