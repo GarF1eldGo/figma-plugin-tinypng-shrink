@@ -1,0 +1,12 @@
+{
+  "name": "TinyPNG Exporter",
+  "id": "figma-tinypng-exporter",
+  "api": "1.0.0",
+  "main": "dist/code.js",
+  "ui": "dist/ui.html",
+  "editorType": ["figma"],
+  "networkAccess": {
+    "allowedDomains": ["https://api.tinify.com", "https://httpbin.org", "https://tinypng-upload.2854919592.workers.dev"],
+    "reasoning": "Used to compress exported images via TinyPNG API"
+  }
+}

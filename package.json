@@ -1,0 +1,13 @@
+{
+  "name": "figma-tinypng-plugin",
+  "version": "1.0.0",
+  "description": "Figma plugin to export images compressed via TinyPNG API",
+  "scripts": {
+    "build": "npx esbuild src/code.ts --bundle --outfile=dist/code.js --platform=browser --target=es2017 && node build-ui.js",
+    "watch": "npx esbuild src/code.ts --bundle --outfile=dist/code.js --platform=browser --target=es2017 --watch"
+  },
+  "devDependencies": {
+    "@figma/plugin-typings": "^1.95.0",
+    "esbuild": "^0.21.0"
+  }
+}

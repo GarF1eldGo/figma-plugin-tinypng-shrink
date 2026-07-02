@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8" />
+<title>TinyPNG Exporter</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; color: #333; background: #fff; padding: 12px; }
+  h2 { font-size: 14px; font-weight: 600; margin-bottom: 12px; }
+  .field { margin-bottom: 10px; }
+  label { display: block; font-weight: 500; margin-bottom: 4px; color: #555; }
+  input, select {
+    width: 100%; padding: 6px 8px; border: 1px solid #d0d0d0; border-radius: 4px; font-size: 12px; outline: none;
+  }
+  input:focus, select:focus { border-color: #18a0fb; }
+  .row { display: flex; gap: 8px; }
+  .row .field { flex: 1; }
+  .hint { font-size: 10px; color: #999; margin-top: 3px; }
+  .btn { width: 100%; padding: 8px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 600; }
+  .btn-primary { background: #18a0fb; color: #fff; }
+  .btn-primary:hover { background: #0d8de0; }
+  .btn-primary:disabled { background: #a0cfed; cursor: not-allowed; }
+  hr { border: none; border-top: 1px solid #eee; margin: 10px 0; }
+  #log { margin-top: 10px; background: #f7f7f7; border: 1px solid #e0e0e0; border-radius: 4px; padding: 8px; height: 150px; overflow-y: auto; font-size: 11px; line-height: 1.7; font-family: monospace; }
+  .i { color: #333; } .s { color: #1a8a3a; } .e { color: #d0021b; } .w { color: #d48806; }
+  #progress-bar-wrap { margin-top: 6px; background: #eee; border-radius: 2px; height: 4px; display: none; }
+  #progress-bar { height: 4px; background: #18a0fb; border-radius: 2px; width: 0%; transition: width 0.2s; }
+  .key-wrap { position: relative; }
+  .toggle-key { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; font-size: 11px; color: #999; }
+</style>
+</head>
+<body>
+<h2>TinyPNG Exporter</h2>
+
+<div class="field">
+  <label>TinyPNG API Key</label>
+  <div class="key-wrap">
+    <input id="apiKey" type="password" placeholder="your_tinypng_api_key" autocomplete="off" />
+    <button class="toggle-key" id="toggleKey">显示</button>
+  </div>
+  <div class="hint">前往 <a href="https://tinypng.com/developers" target="_blank" rel="noopener noreferrer">tinypng.com/developers</a> 免费申请</div>
+</div>
+
+<div class="row">
+  <div class="field">
+    <label>压缩次数</label>
+    <input id="compressionTimes" type="number" min="1" max="10" value="2" />
+    <div class="hint">循环压缩次数（1~10）</div>
+  </div>
+  <div class="field">
+    <label>导出格式</label>
+    <select id="exportFormat">
+      <option value="png">PNG</option>
+      <option value="jpg">JPG</option>
+      <option value="webp">WebP</option>
+    </select>
+  </div>
+</div>
+
+<div class="field">
+  <label>导出倍率</label>
+  <select id="exportScale">
+    <option value="1">1x</option>
+    <option value="2" selected>2x</option>
+    <option value="3">3x</option>
+  </select>
+</div>
+
+<hr />
+<button id="exportBtn" class="btn btn-primary">导出并压缩选中图层</button>
+<div id="progress-bar-wrap"><div id="progress-bar"></div></div>
+<div id="log"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const logEl = $('log');
+
+function log(msg, type) {
+  const d = document.createElement('div');
+  d.className = type || 'i';
+  d.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function setProgress(pct) { $('progress-bar').style.width = pct + '%'; }
+
+$('toggleKey').addEventListener('click', function() {
+  const inp = $('apiKey');
+  inp.type = inp.type === 'password' ? 'text' : 'password';
+  this.textContent = inp.type === 'password' ? '显示' : '隐藏';
+});
+
+// ── Promise bridge: network calls delegated to code.ts sandbox ──────────────
+const pending = {};
+let reqIdCounter = 0;
+
+function pluginFetch(type, params) {
+  return new Promise((resolve) => {
+    const requestId = String(++reqIdCounter);
+    pending[requestId] = resolve;
+    parent.postMessage({ pluginMessage: { type, requestId, ...params } }, '*');
+  });
+}
+
+async function tinypngUpload(data, apiKey) {
+  const res = await pluginFetch('tinypng-upload', { data, apiKey });
+  const bodyStr = String(res.body != null ? res.body : '');
+  if (!res.ok) {
+    let errMsg = 'HTTP ' + res.status;
+    try {
+      const j = JSON.parse(bodyStr);
+      errMsg = (j && j.message) ? j.message : ('HTTP ' + res.status + ' ' + bodyStr.slice(0, 300));
+    } catch(_) { errMsg = bodyStr ? ('HTTP ' + res.status + ' ' + bodyStr.slice(0, 300)) : errMsg; }
+    throw new Error(errMsg);
+  }
+  let json;
+  try { json = JSON.parse(bodyStr); } catch(_) {
+    throw new Error('响应解析失败: ' + bodyStr.slice(0, 200));
+  }
+  if (!json || !json.output || !json.output.url) {
+    throw new Error('未返回 output.url: ' + bodyStr.slice(0, 200));
+  }
+  return json;
+}
+
+async function tinypngDownload(url, apiKey, format) {
+  const res = await pluginFetch('tinypng-download', { url, apiKey, format });
+  if (!res.ok) {
+    const detail = res.error ? String(res.error) : ('HTTP ' + res.status);
+    throw new Error('下载失败: ' + detail);
+  }
+  return res.data;
+}
+
+async function compressOnce(data, apiKey, format) {
+  const uploadResult = await tinypngUpload(data, apiKey);
+  return await tinypngDownload(uploadResult.output.url, apiKey, format);
+}
+
+// ── Task queue ──────────────────────────────────────────────────────────────
+let queue = [];
+let processing = false;
+let doneCount = 0;
+let totalExpected = 0;
+let allSent = false;
+
+async function runQueue() {
+  if (processing) return;
+  processing = true;
+  while (queue.length > 0) {
+    await processTask(queue.shift());
+  }
+  processing = false;
+  checkAllDone();
+}
+
+function checkAllDone() {
+  if (allSent && doneCount === totalExpected && !processing && queue.length === 0) {
+    $('exportBtn').disabled = false;
+    log('全部完成！共处理 ' + totalExpected + ' 个图层', 's');
+  }
+}
+
+async function processTask(task) {
+  const { data, filename, format, compressionTimes, progress } = task;
+  const apiKey = $('apiKey').value.trim();
+  log('开始处理: ' + filename);
+
+  let current = data;
+  const originalSize = current.length;
+  let failed = false;
+
+  for (let round = 1; round <= compressionTimes; round++) {
+    log('  第 ' + round + '/' + compressionTimes + ' 次压缩...');
+    try {
+      current = await compressOnce(current, apiKey, format);
+      const saved = ((1 - current.length / originalSize) * 100).toFixed(1);
+      log('  压缩完成，共节省 ' + saved + '%', 's');
+    } catch(e) {
+      log('  第 ' + round + ' 次压缩失败: ' + e.message, 'e');
+      failed = true;
+      break;
+    }
+  }
+
+  if (!failed) {
+    const blob = new Blob([new Uint8Array(current)]);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    log('  已保存: ' + filename, 's');
+  } else {
+    log('  跳过保存（压缩失败）', 'w');
+  }
+
+  setProgress(progress);
+  doneCount++;
+  checkAllDone();
+}
+
+// ── Messages from code.ts ───────────────────────────────────────────────────
+window.onmessage = function(event) {
+  const msg = event.data.pluginMessage;
+  if (!msg) return;
+
+  if (msg.type === 'tinypng-upload-result' || msg.type === 'tinypng-download-result') {
+    const resolve = pending[msg.requestId];
+    if (resolve) { delete pending[msg.requestId]; resolve(msg); }
+    return;
+  }
+  if (msg.type === 'load-api-key') {
+    if (msg.key) $('apiKey').value = msg.key;
+    return;
+  }
+  if (msg.type === 'export-error') {
+    $('exportBtn').disabled = false;
+    log('错误: ' + msg.message, 'e');
+    return;
+  }
+  if (msg.type === 'layer-error') {
+    log('Figma 导出失败: ' + msg.message, 'e');
+    doneCount++;
+    checkAllDone();
+    return;
+  }
+  if (msg.type === 'compress-and-save') {
+    queue.push(msg);
+    runQueue();
+    return;
+  }
+  if (msg.type === 'all-layers-sent') {
+    allSent = true;
+    totalExpected = msg.total;
+    checkAllDone();
+    return;
+  }
+};
+
+$('exportBtn').addEventListener('click', function() {
+  const apiKey = $('apiKey').value.trim();
+  if (!apiKey) { log('请先输入 TinyPNG API Key', 'w'); return; }
+  const times = parseInt($('compressionTimes').value, 10) || 2;
+  if (times < 1 || times > 10) { log('压缩次数范围为 1~10', 'w'); return; }
+
+  this.disabled = true;
+  logEl.innerHTML = '';
+  queue = []; processing = false; doneCount = 0; totalExpected = 0; allSent = false;
+  $('progress-bar-wrap').style.display = 'block';
+  setProgress(0);
+
+  parent.postMessage({ pluginMessage: {
+    type: 'start-export',
+    apiKey,
+    compressionTimes: times,
+    format: $('exportFormat').value,
+    scale: parseFloat($('exportScale').value),
+  }}, '*');
+});
+
+parent.postMessage({ pluginMessage: { type: 'get-api-key' } }, '*');
+</script>
+</body>
+</html>
