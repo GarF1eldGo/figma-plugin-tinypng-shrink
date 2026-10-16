@@ -148,7 +148,11 @@ figma.ui.onmessage = async (msg: UIMessage) => {
       return;
     }
 
-    const figmaFormat = format.toUpperCase() as 'PNG' | 'JPG' | 'WEBP';
+    // Figma 插件 API 的 exportAsync 不支持直接导出 WebP（仅 PNG/JPG/SVG/PDF）：
+    // WebP 走「无损 PNG 导出 → UI 端转码 WebP → TinyPNG 压缩」流程
+    const figmaFormat: 'PNG' | 'JPG' = format === 'webp'
+      ? 'PNG'
+      : (format.toUpperCase() as 'PNG' | 'JPG');
     const total = selection.length;
 
     for (let i = 0; i < selection.length; i++) {

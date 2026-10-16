@@ -51,11 +51,20 @@ npm run build
 
 ## TinyPNG API 工作流
 
-每张图片的压缩流程：
+PNG / JPG：
 
 ```
-Figma exportAsync → (循环 N 次) → POST /shrink → GET 压缩图 → 下载到本地
+Figma exportAsync → (循环 N 次) POST /shrink → GET 压缩图 → 下载到本地
 ```
+
+WebP（Figma 插件 API 不支持直接导出 WebP）：
+
+```
+Figma exportAsync(PNG，无损) → 浏览器端转码为最高画质 WebP → (循环 N 次) POST /shrink → 下载到本地
+```
+
+转码使用 Chromium 原生 WebP 编码器（canvas `toBlob('image/webp', 1)`），
+无需额外依赖；转换完成后由 TinyPNG 负责最终压缩。
 
 每次循环都在上一次压缩结果的基础上再压缩一次，从而进一步减小文件体积。
 

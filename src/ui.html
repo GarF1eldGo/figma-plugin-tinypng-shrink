@@ -168,6 +168,35 @@ async function compressOnce(data, apiKey, format, workerBase) {
   return await tinypngDownload(uploadResult.output.url, apiKey, format, workerBase);
 }
 
+// Figma 无法直接导出 WebP：先把无损 PNG 在浏览器端（Chromium 原生编码器）
+// 转为最高画质 WebP，再交给 TinyPNG 压缩
+async function pngToWebp(data) {
+  const blob = new Blob([new Uint8Array(data)], { type: 'image/png' });
+  const bitmap = await createImageBitmap(blob);
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, 0, 0);
+    const webpBlob = await new Promise(function(resolve, reject) {
+      canvas.toBlob(function(b) {
+        if (b && b.type === 'image/webp') resolve(b);
+        else reject(new Error('当前环境不支持 WebP 编码'));
+      }, 'image/webp', 1);
+    });
+    return Array.from(new Uint8Array(await webpBlob.arrayBuffer()));
+  } finally {
+    if (bitmap.close) bitmap.close();
+  }
+}
+
+function fmtBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(2) + ' MB';
+}
+
 // ── Task queue ──────────────────────────────────────────────────────────────
 let queue = [];
 let processing = false;
@@ -198,10 +227,23 @@ async function processTask(task) {
   log('开始处理: ' + filename);
 
   let current = data;
-  const originalSize = current.length;
   let failed = false;
 
-  for (let round = 1; round <= compressionTimes; round++) {
+  if (format === 'webp') {
+    log('  PNG → WebP 转换中...');
+    try {
+      const pngSize = current.length;
+      current = await pngToWebp(current);
+      log('  转换完成: ' + fmtBytes(pngSize) + ' → ' + fmtBytes(current.length), 's');
+    } catch(e) {
+      log('  PNG → WebP 转换失败: ' + e.message, 'e');
+      failed = true;
+    }
+  }
+
+  const originalSize = current.length;
+
+  for (let round = 1; !failed && round <= compressionTimes; round++) {
     log('  第 ' + round + '/' + compressionTimes + ' 次压缩...');
     try {
       current = await compressOnce(current, apiKey, format, workerBase);
