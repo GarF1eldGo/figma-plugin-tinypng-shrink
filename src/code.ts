@@ -21,7 +21,7 @@ interface SaveSettingsRequest {
 
 interface TinyPNGUploadRequest {
   type: 'tinypng-upload';
-  data: number[];
+  dataBase64: string;
   apiKey: string;
   workerBase: string;
   requestId: string;
@@ -46,6 +46,59 @@ type UIMessage =
 const STORAGE_KEY_API = 'tinypng_api_key';
 const STORAGE_KEY_WORKER = 'tinypng_worker_base';
 
+// 二进制经 postMessage 传输时统一用 base64：
+// 数字数组走 JSON 会被放大 4 倍以上（每个字节 ~4 个字符），大批量导出极易卡住甚至丢消息
+const B64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+const B64_LOOKUP = (() => {
+  const table = new Uint8Array(256);
+  for (let i = 0; i < B64_CHARS.length; i++) table[B64_CHARS.charCodeAt(i)] = i;
+  return table;
+})();
+
+function encodeBase64(bytes: Uint8Array): string {
+  const out: string[] = [];
+  const STEP = 3 * 8192; // 每片输入字节数（3 的倍数）
+  for (let start = 0; start < bytes.length; start += STEP) {
+    const end = Math.min(start + STEP, bytes.length);
+    let chunk = '';
+    let i = start;
+    for (; i + 3 <= end; i += 3) {
+      const n = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
+      chunk += B64_CHARS[(n >> 18) & 63] + B64_CHARS[(n >> 12) & 63] + B64_CHARS[(n >> 6) & 63] + B64_CHARS[n & 63];
+    }
+    if (end === bytes.length) {
+      const rest = bytes.length - i;
+      if (rest === 1) {
+        const n = bytes[i] << 16;
+        chunk += B64_CHARS[(n >> 18) & 63] + B64_CHARS[(n >> 12) & 63] + '==';
+      } else if (rest === 2) {
+        const n = (bytes[i] << 16) | (bytes[i + 1] << 8);
+        chunk += B64_CHARS[(n >> 18) & 63] + B64_CHARS[(n >> 12) & 63] + B64_CHARS[(n >> 6) & 63] + '=';
+      }
+    }
+    out.push(chunk);
+  }
+  return out.join('');
+}
+
+function decodeBase64(str: string): Uint8Array {
+  let len = str.length;
+  while (len > 0 && str.charCodeAt(len - 1) === 61 /* '=' */) len--;
+  const out = new Uint8Array(Math.floor((len * 3) / 4));
+  let outPos = 0;
+  for (let i = 0; i < len; i += 4) {
+    const a = B64_LOOKUP[str.charCodeAt(i)];
+    const b = B64_LOOKUP[str.charCodeAt(i + 1)];
+    const c = i + 2 < len ? B64_LOOKUP[str.charCodeAt(i + 2)] : 0;
+    const d = i + 3 < len ? B64_LOOKUP[str.charCodeAt(i + 3)] : 0;
+    const n = (a << 18) | (b << 12) | (c << 6) | d;
+    out[outPos++] = (n >> 16) & 255;
+    if (outPos < out.length) out[outPos++] = (n >> 8) & 255;
+    if (outPos < out.length) out[outPos++] = n & 255;
+  }
+  return out;
+}
+
 figma.showUI(__html__, { width: 320, height: 560 });
 
 figma.ui.onmessage = async (msg: UIMessage) => {
@@ -68,13 +121,15 @@ figma.ui.onmessage = async (msg: UIMessage) => {
 
   if (msg.type === 'tinypng-upload') {
     try {
+      // 注意：Figma 沙盒的 fetch 校验 body 只接受 Uint8Array / string，不接受 ArrayBuffer
+      const uploadBytes = decodeBase64(msg.dataBase64);
       const res = await fetch(msg.workerBase + '/shrink', {
         method: 'POST',
         headers: {
           'X-TinyPNG-Key': msg.apiKey,
           'Content-Type': 'application/octet-stream',
         },
-        body: new Uint8Array(msg.data),
+        body: uploadBytes,
       });
       const body = await res.text();
       figma.ui.postMessage({
@@ -113,7 +168,7 @@ figma.ui.onmessage = async (msg: UIMessage) => {
           requestId: msg.requestId,
           ok: false,
           status: res.status,
-          data: [],
+          dataBase64: '',
           error: errBody,
         });
         return;
@@ -124,7 +179,7 @@ figma.ui.onmessage = async (msg: UIMessage) => {
         requestId: msg.requestId,
         ok: true,
         status: res.status,
-        data: Array.from(new Uint8Array(buf)),
+        dataBase64: encodeBase64(new Uint8Array(buf)),
       });
     } catch (e: unknown) {
       figma.ui.postMessage({
@@ -132,7 +187,7 @@ figma.ui.onmessage = async (msg: UIMessage) => {
         requestId: msg.requestId,
         ok: false,
         status: 0,
-        data: [],
+        dataBase64: '',
         error: e instanceof Error ? e.message : String(e),
       });
     }
@@ -165,7 +220,7 @@ figma.ui.onmessage = async (msg: UIMessage) => {
         });
       } catch (e: unknown) {
         const errMsg = e instanceof Error ? e.message : String(e);
-        figma.ui.postMessage({ type: 'layer-error', message: errMsg });
+        figma.ui.postMessage({ type: 'layer-error', name: node.name, message: errMsg });
         continue;
       }
 
@@ -175,7 +230,7 @@ figma.ui.onmessage = async (msg: UIMessage) => {
 
       figma.ui.postMessage({
         type: 'compress-and-save',
-        data: Array.from(imageData),
+        dataBase64: encodeBase64(imageData),
         filename,
         format,
         compressionTimes,

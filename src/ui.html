@@ -32,6 +32,8 @@
   details { margin-bottom: 10px; }
   summary { font-size: 11px; color: #888; cursor: pointer; user-select: none; }
   summary:hover { color: #555; }
+  .check-label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .check-label input { width: auto; margin: 0; }
 </style>
 </head>
 <body>
@@ -85,6 +87,20 @@
   </select>
 </div>
 
+<div class="field">
+  <label>并发上传数</label>
+  <input id="concurrency" type="number" min="1" max="8" value="4" />
+  <div class="hint">并行上传的图层数，只缩短等待时间，不省配额（1~8）</div>
+</div>
+
+<div class="field">
+  <label class="check-label">
+    <input id="zipMode" type="checkbox" checked />
+    多选时打包为 ZIP 下载（推荐）
+  </label>
+  <div class="hint">浏览器/桌面端会静默拦截连续的多次自动下载，打包成一个 zip 只下载一次更稳</div>
+</div>
+
 <hr />
 <button id="exportBtn" class="btn btn-primary">导出并压缩选中图层</button>
 <div id="progress-bar-wrap"><div id="progress-bar"></div></div>
@@ -121,6 +137,23 @@ function getWorkerBase() {
   return custom || DEFAULT_WORKER_BASE;
 }
 
+// ── base64 <-> Uint8Array（跨 postMessage 传二进制，比数字数组小 4 倍以上）──────
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function bytesToB64(bytes) {
+  const parts = [];
+  const CHUNK = 8192;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK)));
+  }
+  return btoa(parts.join(''));
+}
+
 // ── Promise bridge: network calls delegated to code.ts sandbox ──────────────
 const pending = {};
 let reqIdCounter = 0;
@@ -134,7 +167,7 @@ function pluginFetch(type, params) {
 }
 
 async function tinypngUpload(data, apiKey, workerBase) {
-  const res = await pluginFetch('tinypng-upload', { data, apiKey, workerBase });
+  const res = await pluginFetch('tinypng-upload', { dataBase64: bytesToB64(data), apiKey, workerBase });
   const bodyStr = String(res.body != null ? res.body : '');
   if (!res.ok) {
     let errMsg = 'HTTP ' + res.status;
@@ -160,7 +193,7 @@ async function tinypngDownload(url, apiKey, format, workerBase) {
     const detail = res.error ? String(res.error) : ('HTTP ' + res.status);
     throw new Error('下载失败: ' + detail);
   }
-  return res.data;
+  return b64ToBytes(res.dataBase64);
 }
 
 async function compressOnce(data, apiKey, format, workerBase) {
@@ -185,7 +218,7 @@ async function pngToWebp(data) {
         else reject(new Error('当前环境不支持 WebP 编码'));
       }, 'image/webp', 1);
     });
-    return Array.from(new Uint8Array(await webpBlob.arrayBuffer()));
+    return new Uint8Array(await webpBlob.arrayBuffer());
   } finally {
     if (bitmap.close) bitmap.close();
   }
@@ -197,37 +230,233 @@ function fmtBytes(n) {
   return (n / 1024 / 1024).toFixed(2) + ' MB';
 }
 
-// ── Task queue ──────────────────────────────────────────────────────────────
+// ── ZIP 打包（store 方式，图片本身已压缩，无需再 deflate）──────────────────────
+let crcTable = null;
+
+function crc32(bytes) {
+  if (!crcTable) {
+    crcTable = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      crcTable[i] = c >>> 0;
+    }
+  }
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = crcTable[(c ^ bytes[i]) & 255] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+function buildZip(files) {
+  const encoder = new TextEncoder();
+  const now = new Date();
+  const time = ((now.getHours() & 31) << 11) | ((now.getMinutes() & 63) << 5) | ((now.getSeconds() / 2) & 31);
+  const date = (((now.getFullYear() - 1980) & 127) << 9) | (((now.getMonth() + 1) & 15) << 5) | (now.getDate() & 31);
+
+  const body = [];
+  const central = [];
+  let offset = 0;
+
+  files.forEach(function(f) {
+    const nameBytes = encoder.encode(f.filename);
+    const crc = crc32(f.data);
+    const size = f.data.length;
+
+    const local = new Uint8Array(30 + nameBytes.length);
+    const lv = new DataView(local.buffer);
+    lv.setUint32(0, 0x04034b50, true);   // local file header
+    lv.setUint16(4, 20, true);           // version needed
+    lv.setUint16(6, 0x0800, true);       // flag: UTF-8 文件名
+    lv.setUint16(8, 0, true);            // method: store
+    lv.setUint16(10, time, true);
+    lv.setUint16(12, date, true);
+    lv.setUint32(14, crc, true);
+    lv.setUint32(18, size, true);
+    lv.setUint32(22, size, true);
+    lv.setUint16(26, nameBytes.length, true);
+    lv.setUint16(28, 0, true);
+    local.set(nameBytes, 30);
+    body.push(local, f.data);
+
+    const entry = new Uint8Array(46 + nameBytes.length);
+    const cv = new DataView(entry.buffer);
+    cv.setUint32(0, 0x02014b50, true);   // central directory header
+    cv.setUint16(4, 20, true);           // version made by
+    cv.setUint16(6, 20, true);           // version needed
+    cv.setUint16(8, 0x0800, true);
+    cv.setUint16(10, 0, true);
+    cv.setUint16(12, time, true);
+    cv.setUint16(14, date, true);
+    cv.setUint32(16, crc, true);
+    cv.setUint32(20, size, true);
+    cv.setUint32(24, size, true);
+    cv.setUint16(28, nameBytes.length, true);
+    cv.setUint32(42, offset, true);      // 本地头偏移
+    entry.set(nameBytes, 46);
+    central.push(entry);
+
+    offset += local.length + size;
+  });
+
+  const centralSize = central.reduce(function(n, c) { return n + c.length; }, 0);
+  const eocd = new Uint8Array(22);
+  const ev = new DataView(eocd.buffer);
+  ev.setUint32(0, 0x06054b50, true);     // end of central directory
+  ev.setUint16(8, files.length, true);
+  ev.setUint16(10, files.length, true);
+  ev.setUint32(12, centralSize, true);
+  ev.setUint32(16, offset, true);
+
+  const out = new Uint8Array(offset + centralSize + eocd.length);
+  let pos = 0;
+  body.concat(central).forEach(function(part) {
+    out.set(part, pos);
+    pos += part.length;
+  });
+  out.set(eocd, pos);
+  return out;
+}
+
+// ── 下载 ────────────────────────────────────────────────────────────────────
+function triggerDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  // 立即 revoke 可能打断正在写入的下载，统一延后回收
+  setTimeout(function() { URL.revokeObjectURL(url); }, 60000);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+function sleep(ms) {
+  return new Promise(function(resolve) { setTimeout(resolve, ms); });
+}
+
+// 同名图层（多个 icon、Frame 等）打包进同一个 zip 会互相覆盖，这里加序号去重
+function uniqueFilename(name) {
+  let candidate = name;
+  let n = 2;
+  while (results.some(function(r) { return r.filename === candidate; })) {
+    const dot = name.lastIndexOf('.');
+    candidate = dot > 0
+      ? name.slice(0, dot) + '-' + n + name.slice(dot)
+      : name + '-' + n;
+    n++;
+  }
+  return candidate;
+}
+
+function zipStamp() {
+  const d = new Date();
+  const p = function(n) { return (n < 10 ? '0' : '') + n; };
+  return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes());
+}
+
+// ── Task queue（多任务并发）──────────────────────────────────────────────────
 let queue = [];
-let processing = false;
+let activeCount = 0;
 let doneCount = 0;
 let totalExpected = 0;
 let allSent = false;
+let finished = false;
+let idleTimer = null;
+let concurrency = 4;
+const results = [];    // { filename, data }
+const failures = [];   // { name, reason }
 
-async function runQueue() {
-  if (processing) return;
-  processing = true;
-  while (queue.length > 0) {
-    await processTask(queue.shift());
+// 并发泵：最多同时跑 concurrency 个任务，任务结束自动补位
+function pump() {
+  if (finished) return;
+  while (activeCount < concurrency && queue.length > 0) {
+    const task = queue.shift();
+    activeCount++;
+    processTaskSafe(task);
   }
-  processing = false;
   checkAllDone();
 }
 
-function checkAllDone() {
-  if (allSent && doneCount === totalExpected && !processing && queue.length === 0) {
-    $('exportBtn').disabled = false;
-    log('全部完成！共处理 ' + totalExpected + ' 个图层', 's');
+async function processTaskSafe(task) {
+  try {
+    await processTask(task);
+  } catch (e) {
+    // 单个图层出异常不能拖垮整个队列
+    const reason = e && e.message ? e.message : String(e);
+    failures.push({ name: task.filename, reason });
+    log('  处理异常: ' + task.filename + ' — ' + reason, 'e');
+    doneCount++;
+    setProgress(Math.round((doneCount / Math.max(totalExpected, 1)) * 100));
+  } finally {
+    activeCount--;
+    bumpIdleTimer();
+    pump();
+    checkAllDone();
   }
 }
 
+function checkAllDone() {
+  if (!allSent || finished) return;
+  if (queue.length > 0 || activeCount > 0) return;
+  if (doneCount < totalExpected) return;
+  finalize();
+}
+
+// 兜底：全部消息已发完、队列也空了，但收到的图层数少于选中数（postMessage 丢消息）
+function bumpIdleTimer() {
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = setTimeout(function() {
+    if (!allSent || finished) return;
+    if (queue.length > 0 || activeCount > 0) return;
+    if (doneCount >= totalExpected) return;
+    log('警告: ' + (totalExpected - doneCount) + ' 个图层未收到导出数据，先保存已完成的文件', 'w');
+    failures.push({ name: '未收到数据的图层', reason: '共 ' + (totalExpected - doneCount) + ' 个' });
+    finalize();
+  }, 10000);
+}
+
+async function finalize() {
+  if (finished) return;
+  finished = true;
+  if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+
+  try {
+    const zipMode = $('zipMode').checked && results.length > 1;
+    if (zipMode) {
+      log('打包 ' + results.length + ' 个文件为 ZIP...');
+      const zipData = buildZip(results);
+      triggerDownload(new Blob([zipData], { type: 'application/zip' }), 'tinypng-export-' + zipStamp() + '.zip');
+      log('已保存: tinypng-export.zip（' + fmtBytes(zipData.length) + '，含 ' + results.length + ' 个文件）', 's');
+    } else {
+      // 逐个下载：多次自动下载可能被拦截，间隔一下更稳
+      for (let i = 0; i < results.length; i++) {
+        const r = results[i];
+        triggerDownload(new Blob([r.data]), r.filename);
+        log('  已保存: ' + r.filename, 's');
+        if (i < results.length - 1) await sleep(300);
+      }
+    }
+  } catch (e) {
+    log('保存失败: ' + (e && e.message ? e.message : e), 'e');
+  }
+
+  if (failures.length > 0) {
+    log('处理结束：成功 ' + results.length + ' 个，失败 ' + failures.length + ' 个', 'w');
+    failures.forEach(function(f) { log('  失败: ' + f.name + ' — ' + f.reason, 'e'); });
+  } else {
+    log('全部完成！共处理 ' + results.length + ' 个图层', 's');
+  }
+  $('exportBtn').disabled = false;
+}
+
 async function processTask(task) {
-  const { data, filename, format, compressionTimes, progress, workerBase } = task;
+  const { filename, format, compressionTimes, workerBase } = task;
   const apiKey = $('apiKey').value.trim();
   log('开始处理: ' + filename);
 
-  let current = data;
+  let current = b64ToBytes(task.dataBase64);
   let failed = false;
+  let reason = '';
 
   if (format === 'webp') {
     log('  PNG → WebP 转换中...');
@@ -238,6 +467,7 @@ async function processTask(task) {
     } catch(e) {
       log('  PNG → WebP 转换失败: ' + e.message, 'e');
       failed = true;
+      reason = 'WebP 转码失败';
     }
   }
 
@@ -252,24 +482,19 @@ async function processTask(task) {
     } catch(e) {
       log('  第 ' + round + ' 次压缩失败: ' + e.message, 'e');
       failed = true;
+      reason = e.message;
       break;
     }
   }
 
   if (!failed) {
-    const blob = new Blob([new Uint8Array(current)]);
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = filename;
-    document.body.appendChild(a); a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    log('  已保存: ' + filename, 's');
+    results.push({ filename: uniqueFilename(filename), data: current });
   } else {
+    failures.push({ name: filename, reason });
     log('  跳过保存（压缩失败）', 'w');
   }
 
-  setProgress(progress);
+  setProgress(Math.round((doneCount / Math.max(totalExpected, 1)) * 100));
   doneCount++;
   checkAllDone();
 }
@@ -295,19 +520,23 @@ window.onmessage = function(event) {
     return;
   }
   if (msg.type === 'layer-error') {
-    log('Figma 导出失败: ' + msg.message, 'e');
+    log('Figma 导出失败: ' + (msg.name ? msg.name + ' — ' : '') + msg.message, 'e');
+    failures.push({ name: msg.name || '未命名图层', reason: msg.message });
     doneCount++;
+    setProgress(Math.round((doneCount / Math.max(totalExpected, 1)) * 100));
     checkAllDone();
     return;
   }
   if (msg.type === 'compress-and-save') {
     queue.push(msg);
-    runQueue();
+    bumpIdleTimer();
+    pump();
     return;
   }
   if (msg.type === 'all-layers-sent') {
     allSent = true;
     totalExpected = msg.total;
+    bumpIdleTimer();
     checkAllDone();
     return;
   }
@@ -320,10 +549,13 @@ $('exportBtn').addEventListener('click', function() {
   if (times < 1 || times > 10) { log('压缩次数范围为 1~10', 'w'); return; }
 
   const workerBase = getWorkerBase();
+  concurrency = Math.min(8, Math.max(1, parseInt($('concurrency').value, 10) || 4));
 
   this.disabled = true;
   logEl.innerHTML = '';
-  queue = []; processing = false; doneCount = 0; totalExpected = 0; allSent = false;
+  queue = []; activeCount = 0; doneCount = 0; totalExpected = 0; allSent = false;
+  finished = false; results.length = 0; failures.length = 0;
+  if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
   $('progress-bar-wrap').style.display = 'block';
   setProgress(0);
 
